@@ -1,0 +1,140 @@
+# AgentRay for Swift
+
+The client for native Apple apps. One `start()` wires up identity (anonymous ↔
+identified, and the alias that links them), batched delivery, offline retry, and
+a flush when the app goes to the background.
+
+If your product is a website *and* an app, this is the half that makes them
+comparable: every event it sends carries `platform: ios`, so Traffic, Product,
+and the funnel can separate your app's audience from your site's instead of
+averaging them.
+
+## Install
+
+Swift Package Manager resolves a package from a `Package.swift` at a repository
+root, and this one lives at `sdk/swift/` in a repo that is mostly Go and
+Next.js. So each release is published to a generated mirror whose root *is* this
+package:
+
+```swift
+.package(url: "https://github.com/lohi-ai/agentray-swift.git", from: "0.1.0")
+```
+
+or in Xcode: **File → Add Package Dependencies…** and paste that URL.
+
+The mirror is CI output — the source is here, and so are issues and pull
+requests. To build against an unreleased change, point at this directory
+instead:
+
+```swift
+.package(path: "../agentray/sdk/swift")
+```
+
+No package at all? The in-app snippet at **Dashboards → Send your first event →
+iOS app** (also **Set up → 2 · iOS app**) is one file you can paste, with the
+same event contract.
+
+## Quick start
+
+```swift
+import AgentRay
+
+// Once, at launch
+AgentRay.start(host: "https://agentray.example.com", apiKey: "agentray_…")
+
+// Each screen — lands as user.pageview, the event the charts already read
+AgentRay.shared.screen("Library")
+
+// Anything else
+AgentRay.shared.capture("user.signup", properties: ["plan": "free"])
+
+// On login — links this install's anonymous history to the user
+AgentRay.shared.identify("user_123", traits: ["email": "alice@example.com"])
+
+// On logout
+AgentRay.shared.reset()
+```
+
+SwiftUI:
+
+```swift
+struct LibraryView: View {
+    var body: some View {
+        List { /* … */ }
+            .onAppear { AgentRay.shared.screen("Library") }
+    }
+}
+```
+
+## API
+
+| Method | Purpose |
+| --- | --- |
+| `AgentRay.start(host:apiKey:)` | Create the shared client. Also takes an `AgentRayConfiguration`. |
+| `capture(_:properties:)` | Queue an event (flushed in batches). |
+| `screen(_:properties:)` | Queue a screen view as `user.pageview` with `screen` + `path`. |
+| `identify(_:traits:)` | Switch to a user; aliases the anonymous history first. |
+| `reset()` | Flush, then start a fresh anonymous identity (call on logout). |
+| `flush()` | Force-send what is buffered. |
+| `distinctID` | The id events are currently attributed to. |
+
+## Why `identify` matters
+
+Someone reads your marketing site, installs the app, and signs in. Without the
+alias that `identify` sends, AgentRay sees two people: an anonymous browser and
+an anonymous device. Your visitor count is inflated, and the funnel that spans
+both is two halves of one person.
+
+`identify` posts `/alias` linking the previous id to the user before switching,
+so the history joins up. Call it on every login, not just the first — it is
+idempotent, and identifying the same user twice sends one alias.
+
+## Delivery semantics
+
+Events are buffered and sent to `POST /batch` when the buffer reaches
+`batchSize` (default 20) or after `flushInterval` (default 3s). A 5xx or network
+failure retries with exponential backoff up to `maxRetries` (default 3); after
+that the batch goes back to the **front** of the queue rather than being dropped,
+so a tunnel costs latency and not data. The queue is capped at `maxQueuedEvents`
+(default 500) — past that the oldest events are dropped.
+
+A 4xx is not retried. A bad key or a malformed payload cannot be fixed by
+sending it again, and re-queueing it would block everything behind it.
+
+The client flushes on `didEnterBackground` and `willTerminate`, inside a short
+background task so the request survives the transition. There is no browser
+`sendBeacon` equivalent on iOS — backgrounding is the last reliable moment, which
+is why `reset()` flushes before clearing the identity.
+
+## Configuration
+
+```swift
+var config = AgentRayConfiguration(host: "https://…", apiKey: "agentray_…")
+config.batchSize = 20
+config.flushInterval = 3
+config.maxRetries = 3
+config.maxQueuedEvents = 500
+config.platform = "ios"     // override for a tvOS / Catalyst build
+AgentRay.start(configuration: config)
+```
+
+## Event names
+
+`screen()` sends `user.pageview` because that is the name the Traffic and Product
+surfaces read — an app screen shows up in the charts the owner already has. Names
+matching `user.pageview` / `user.signup` / `user.conversion` light the default
+funnel without a custom query. Everything else is yours.
+
+## Tests
+
+```bash
+cd sdk/swift && swift test
+```
+
+---
+
+This repository is a published mirror of `sdk/swift/` in
+[lohi-ai/agentray](https://github.com/lohi-ai/agentray),
+so that SwiftPM can resolve the package from a repository root.
+It is generated by CI — open issues and pull requests against the
+source repository, not here.
