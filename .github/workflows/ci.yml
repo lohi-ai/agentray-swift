@@ -1,0 +1,30 @@
+# Build and test the package on every change.
+#
+# This repo is the Swift SDK's source, not a generated mirror: it is carried as a
+# submodule at sdk/swift/ in lohi-ai/agentray. SwiftPM reads Package.swift from a
+# repository *root* and clones the entire repository to do it, which is why the
+# Swift client lives here rather than inside that mostly-Go monorepo.
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build
+      - run: swift test
+
+      # /bin/bash on a macOS runner is still 3.2 and parses some constructs
+      # differently from the bash 5 on Linux runners — a heredoc inside a command
+      # substitution most notably. A release workflow is not run by anything until
+      # a tag is pushed, so a shell error in it surfaces at the worst moment.
+      - name: run blocks parse on this runner
+        run: |
+          python3 -m pip install --quiet --break-system-packages pyyaml 2>/dev/null || python3 -m pip install --quiet pyyaml
+          python3 .github/check-shell.py

@@ -1,0 +1,92 @@
+# Publish a version. The tag IS the release: SwiftPM resolves versions from git
+# tags, so pushing `0.2.0` is what makes `from: "0.2.0"` resolvable.
+#
+# No secret is involved. CI here writes to its own repository, so the built-in
+# GITHUB_TOKEN is enough — which is the whole reason the Swift SDK lives in its
+# own repo with its own CI rather than being pushed into one from the monorepo.
+#
+# Tags are bare semver (`0.2.0`), not `v0.2.0` and not `swift-v0.2.0`: SwiftPM
+# accepts a `v` prefix but bare semver leaves `from:` unambiguous.
+name: release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, e.g. 0.2.0'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: the version is a real semver tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::$TAG is not bare semver — SwiftPM resolves versions from these tags"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          case "$TAG" in *-*) echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV" ;; *) echo "PRERELEASE=" >> "$GITHUB_ENV" ;; esac
+
+      # The release gate is the PR gate, run again on the exact tagged tree.
+      - run: swift build
+      - run: swift test
+
+      # A consumer resolves this repo by URL and version, so that is what gets
+      # checked — not the checkout we already have. Catches a Package.swift that
+      # only builds with something the monorepo happened to provide.
+      - name: a consumer can resolve this tag by URL
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/consumer/Sources/App" && cd "$RUNNER_TEMP/consumer"
+          cat > Package.swift <<SPM
+          // swift-tools-version: 5.9
+          import PackageDescription
+          let package = Package(
+              name: "App", platforms: [.macOS(.v11)],
+              dependencies: [.package(url: "${{ github.server_url }}/${{ github.repository }}.git", exact: "$TAG")],
+              targets: [.executableTarget(name: "App", dependencies: [.product(name: "AgentRay", package: "agentray-swift")])]
+          )
+          SPM
+          printf 'import AgentRay\nAgentRay.start(host: "https://a.test", apiKey: "k")\nprint("resolved \\(String(describing: AgentRay.self))")\n' > Sources/App/main.swift
+          swift run
+
+      - name: GitHub Release
+        run: |
+          set -euo pipefail
+          NOTES_FILE="${RUNNER_TEMP:-/tmp}/notes.md"
+          cat > "$NOTES_FILE" <<EOF
+          AgentRay $TAG for Swift — iOS, macOS, tvOS, watchOS.
+
+          **Install**
+
+          \`\`\`swift
+          .package(url: "${{ github.server_url }}/${{ github.repository }}.git", from: "$TAG")
+          \`\`\`
+
+          Source of record for this SDK. The AgentRay server, web app and the
+          browser/server/Python SDKs live in
+          [lohi-ai/agentray](${{ github.server_url }}/lohi-ai/agentray), which
+          carries this repository as a submodule at \`sdk/swift/\`.
+          EOF
+          gh release create "$TAG" --title "AgentRay $TAG" --notes-file "$NOTES_FILE" $PRERELEASE \
+            || gh release edit "$TAG" --notes-file "$NOTES_FILE"
