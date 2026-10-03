@@ -72,6 +72,11 @@ final class BatchTransport {
 
     private var pending: [QueuedEvent] = []
     private var timer: DispatchSourceTimer?
+    private var isDelivering = false
+    private var isBackgrounded = false
+    private var failures = 0
+    private var retryAt: Date?
+    private let retryDelay: (Int, Int) -> TimeInterval
 
     init(
         host: String,
@@ -80,7 +85,8 @@ final class BatchTransport {
         flushInterval: TimeInterval,
         maxRetries: Int,
         maxQueued: Int,
-        http: AgentRayHTTPClient
+        http: AgentRayHTTPClient,
+        retryDelay: @escaping (Int, Int) -> TimeInterval = BatchTransport.retryDelay
     ) {
         self.host = host
         self.apiKey = apiKey
@@ -89,6 +95,7 @@ final class BatchTransport {
         self.maxRetries = max(1, maxRetries)
         self.maxQueued = max(batchSize, maxQueued)
         self.http = http
+        self.retryDelay = retryDelay
     }
 
     func enqueue(_ event: QueuedEvent) {
@@ -123,12 +130,32 @@ final class BatchTransport {
         http.post(url: url, body: data) { _, _ in }
     }
 
+    /// Send at most one final batch when entering the background. Playback can
+    /// keep the process awake for hours; it must not keep analytics retrying.
+    func setBackgrounded(_ backgrounded: Bool) {
+        queue.async {
+            self.isBackgrounded = backgrounded
+            self.cancelTimerLocked()
+            self.flushLocked(allowBackground: backgrounded)
+        }
+    }
+
+    /// The failure count survives requeues and new events. After the short
+    /// retry budget, cool down for 30s … 5min (plus jitter) instead of resetting to 1s.
+    static func retryDelay(failures: Int, maxRetries: Int) -> TimeInterval {
+        let base = failures < maxRetries
+            ? min(pow(2, Double(failures - 1)), 8)
+            : min(30 * pow(2, Double(min(failures - maxRetries, 4))), 300)
+        return base * Double.random(in: 1...1.2)
+    }
+
     // MARK: - private
 
     private func scheduleLocked() {
-        guard timer == nil else { return }
+        guard timer == nil, !isBackgrounded, !isDelivering, !pending.isEmpty else { return }
         let source = DispatchSource.makeTimerSource(queue: queue)
-        source.schedule(deadline: .now() + flushInterval)
+        let delay = max(flushInterval, retryAt?.timeIntervalSinceNow ?? 0)
+        source.schedule(deadline: .now() + delay, leeway: .milliseconds(100))
         source.setEventHandler { [weak self] in self?.flushLocked() }
         timer = source
         source.resume()
@@ -139,50 +166,49 @@ final class BatchTransport {
         timer = nil
     }
 
-    private func flushLocked() {
+    private func flushLocked(allowBackground: Bool = false) {
         cancelTimerLocked()
-        guard !pending.isEmpty else { return }
+        guard !isDelivering, !pending.isEmpty else { return }
+        guard !isBackgrounded || allowBackground else { return }
+        if let retryAt, retryAt > Date() {
+            scheduleLocked()
+            return
+        }
         let batch = pending
         pending = []
-        deliver(batch, attempt: 0)
+        deliver(batch)
     }
 
-    private func deliver(_ batch: [QueuedEvent], attempt: Int) {
+    private func deliver(_ batch: [QueuedEvent]) {
         guard let url = URL(string: host + "/batch") else { return }
         let body: [String: Any] = [
             "api_key": apiKey,
             "batch": batch.map { $0.payload(iso: iso) },
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-
+        isDelivering = true
         http.post(url: url, body: data) { [weak self] status, _ in
             guard let self else { return }
-            if let status {
-                // 4xx is the server saying the request itself is wrong — a bad key,
-                // a malformed payload. Retrying cannot fix that, and re-queueing
-                // would block every later batch behind it forever.
-                if (200..<300).contains(status) || (400..<500).contains(status) { return }
-            }
             self.queue.async {
-                if attempt + 1 >= self.maxRetries {
-                    self.requeueLocked(batch)
-                    return
+                self.isDelivering = false
+                // 408/429 are temporary; invalid credentials and malformed
+                // payloads remain terminal. All state lives on this queue.
+                if let status, (200..<300).contains(status)
+                    || ((400..<500).contains(status) && status != 408 && status != 429) {
+                    self.failures = 0
+                    self.retryAt = nil
+                } else {
+                    self.failures = min(self.failures + 1, self.maxRetries + 20)
+                    self.retryAt = Date().addingTimeInterval(
+                        self.retryDelay(self.failures, self.maxRetries)
+                    )
+                    self.pending.insert(contentsOf: batch, at: 0)
+                    if self.pending.count > self.maxQueued {
+                        self.pending.removeFirst(self.pending.count - self.maxQueued)
+                    }
                 }
-                let backoff = min(pow(2.0, Double(attempt)), 8.0)
-                self.queue.asyncAfter(deadline: .now() + backoff) {
-                    self.deliver(batch, attempt: attempt + 1)
-                }
+                self.scheduleLocked()
             }
         }
-    }
-
-    /// Puts an undelivered batch back at the front so it goes out before newer
-    /// events, then re-arms the timer to try again.
-    private func requeueLocked(_ batch: [QueuedEvent]) {
-        pending.insert(contentsOf: batch, at: 0)
-        if pending.count > maxQueued {
-            pending.removeFirst(pending.count - maxQueued)
-        }
-        scheduleLocked()
     }
 }

@@ -13,7 +13,7 @@ public struct AgentRayConfiguration {
     public var batchSize: Int
     /// Flush at most this long after the first buffered event.
     public var flushInterval: TimeInterval
-    /// Delivery attempts per batch before the batch goes back in the queue.
+    /// Consecutive failures before switching from short retries to outage cooldown.
     public var maxRetries: Int
     /// Ceiling on buffered events while offline. Oldest are dropped past it.
     public var maxQueuedEvents: Int
@@ -130,7 +130,7 @@ public final class AgentRay {
     /// The id events are currently attributed to.
     public var distinctID: String { identity.distinctID }
 
-    /// Queue an event. Delivery is batched; call `flush()` to force it.
+    /// Queue an event. Delivery is batched; `flush()` requests an earlier send.
     public func capture(_ event: String, properties: [String: Any] = [:]) {
         var props = properties
         // Set last so a caller cannot accidentally mislabel which app this is.
@@ -187,7 +187,7 @@ public final class AgentRay {
         identity.reset()
     }
 
-    /// Send everything buffered now.
+    /// Request a buffered send, respecting outage cooldown and background suspension.
     public func flush() {
         transport.flush()
     }
@@ -204,10 +204,15 @@ public final class AgentRay {
         let names: [Notification.Name] = [
             UIApplication.didEnterBackgroundNotification,
             UIApplication.willTerminateNotification,
+            UIApplication.willEnterForegroundNotification,
         ]
         for name in names {
-            let observer = center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
-                self?.flushInBackgroundTask()
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                if notification.name == UIApplication.willEnterForegroundNotification {
+                    self?.transport.setBackgrounded(false)
+                } else {
+                    self?.flushInBackgroundTask()
+                }
             }
             observers.append(observer)
         }
@@ -224,7 +229,7 @@ public final class AgentRay {
             application.endBackgroundTask(task)
             task = .invalid
         }
-        flush()
+        transport.setBackgrounded(true)
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
             if task != .invalid {
                 application.endBackgroundTask(task)
@@ -232,7 +237,7 @@ public final class AgentRay {
             }
         }
         #else
-        flush()
+        transport.setBackgrounded(true)
         #endif
     }
 }
