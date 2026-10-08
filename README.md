@@ -131,3 +131,12 @@ From the package root (`sdk/swift/` in the source repo, or the mirror's root):
 ```bash
 swift test
 ```
+
+## Releases
+
+Update `VERSION` to a new SemVer and push `main`. One workflow builds
+and tests that exact commit, creates its immutable bare SemVer tag, verifies a
+SwiftPM consumer, then publishes source/docs/download instructions. Unchanged
+versions still run CI and skip publication. PRs call the same read-only gate.
+An unpublished tag or draft can be resumed via the release workflow's `tag`
+input at the same commit; published tags and assets are never replaced.

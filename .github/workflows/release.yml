@@ -1,59 +1,86 @@
-# Publish a version. The tag IS the release: SwiftPM resolves versions from git
-# tags, so pushing `0.2.0` is what makes `from: "0.2.0"` resolvable.
-#
-# No secret is involved. CI here writes to its own repository, so the built-in
-# GITHUB_TOKEN is enough — which is the whole reason the Swift SDK lives in its
-# own repo with its own CI rather than being pushed into one from the monorepo.
-#
-# Tags are bare semver (`0.2.0`), not `v0.2.0` and not `swift-v0.2.0`: SwiftPM
-# accepts a `v` prefix but bare semver leaves `from:` unambiguous.
 name: release
-
 on:
   push:
+    branches: [main]
     tags: ['[0-9]+.[0-9]+.[0-9]+*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to publish, e.g. 0.2.0'
+        description: Existing bare stable semver tag to resume
         required: true
         type: string
-
-concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
-  cancel-in-progress: false
-
 permissions:
-  contents: write
-
+  contents: read
+concurrency:
+  group: swift-release
+  cancel-in-progress: false
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      commit: ${{ steps.plan.outputs.commit }}
+      release: ${{ steps.plan.outputs.release }}
+      createTag: ${{ steps.plan.outputs.createTag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+      - name: Preserve workflow policy for legacy tag retries
+        run: |
+          cp .github/release-plan.mjs "$RUNNER_TEMP/release-plan.mjs"
+          cp .github/release-plan.test.mjs "$RUNNER_TEMP/release-plan.test.mjs"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test "$RUNNER_TEMP/release-plan.test.mjs"
+      - id: plan
+        run: node "$RUNNER_TEMP/release-plan.mjs"
+        env:
+          RELEASE_REF_TYPE: ${{ github.event_name == 'workflow_dispatch' && 'tag' || github.ref_type }}
+          RELEASE_REF_NAME: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+  verify:
+    needs: plan
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.plan.outputs.commit }}
+  tag:
+    needs: [plan, verify]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
+      - if: needs.plan.outputs.createTag == 'true'
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" -m "AgentRay Swift $TAG"
+          git push origin "$TAG"
   release:
+    needs: [plan, tag]
     runs-on: macos-latest
+    permissions:
+      contents: write
     env:
+      TAG: ${{ needs.plan.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
-      - name: the version is a real semver tag
-        run: |
-          set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          if ! printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error::$TAG is not bare semver — SwiftPM resolves versions from these tags"
-            exit 1
-          fi
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          case "$TAG" in *-*) echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV" ;; *) echo "PRERELEASE=" >> "$GITHUB_ENV" ;; esac
-
-      # The release gate is the PR gate, run again on the exact tagged tree.
-      - run: swift build
-      - run: swift test
-
-      # A consumer resolves this repo by URL and version, so that is what gets
-      # checked — not the checkout we already have. Catches a Package.swift that
-      # only builds with something the monorepo happened to provide.
+          ref: ${{ needs.plan.outputs.commit }}
       - name: a consumer can resolve this tag by URL
         run: |
           set -euo pipefail
@@ -70,23 +97,23 @@ jobs:
           printf 'import AgentRay\nAgentRay.start(host: "https://a.test", apiKey: "k")\nprint("resolved \\(String(describing: AgentRay.self))")\n' > Sources/App/main.swift
           swift run
 
-      - name: GitHub Release
+      - name: Publish documentation and source downloads
         run: |
           set -euo pipefail
-          NOTES_FILE="${RUNNER_TEMP:-/tmp}/notes.md"
-          cat > "$NOTES_FILE" <<EOF
-          AgentRay $TAG for Swift — iOS, macOS, tvOS, watchOS.
-
-          **Install**
-
-          \`\`\`swift
-          .package(url: "${{ github.server_url }}/${{ github.repository }}.git", from: "$TAG")
-          \`\`\`
-
-          Source of record for this SDK. The AgentRay server, web app and the
-          browser/server/Python SDKs live in
-          [lohi-ai/agentray](${{ github.server_url }}/lohi-ai/agentray), which
-          carries this repository as a submodule at \`sdk/swift/\`.
-          EOF
-          gh release create "$TAG" --title "AgentRay $TAG" --notes-file "$NOTES_FILE" $PRERELEASE \
-            || gh release edit "$TAG" --notes-file "$NOTES_FILE"
+          git archive --format=tar.gz --output="agentray-swift-${TAG}.tar.gz" HEAD
+          # Markdown code spans are literal in this printf format.
+          # shellcheck disable=SC2016
+          printf '# AgentRay Swift %s\n\nInstall with SwiftPM:\n\n`.package(url: "%s/%s.git", exact: "%s")`\n\nThe source archive includes README and Package.swift.\n' "$TAG" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$TAG" > DOWNLOADS.md
+          shasum -a 256 agentray-swift-*.tar.gz DOWNLOADS.md > checksums.txt
+          if gh release view "$TAG" --json isDraft > state.json 2> release-error.txt; then
+            test "$(python3 -c 'import json; print(json.load(open("state.json"))["isDraft"])')" = True
+          elif grep -q 'release not found' release-error.txt; then
+            case "$TAG" in *-*) prerelease=--prerelease ;; *) prerelease= ;; esac
+            gh release create "$TAG" --verify-tag --draft --title "AgentRay Swift $TAG" $prerelease
+          else
+            cat release-error.txt >&2
+            exit 1
+          fi
+          gh release edit "$TAG" --notes-file DOWNLOADS.md
+          gh release upload "$TAG" agentray-swift-*.tar.gz DOWNLOADS.md checksums.txt --clobber
+          case "$TAG" in *-*) gh release edit "$TAG" --draft=false ;; *) gh release edit "$TAG" --draft=false --latest ;; esac
